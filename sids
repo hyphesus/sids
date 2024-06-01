@@ -24,6 +24,10 @@
 						#    VARIABLES    #
 						###################
 
+FROM="HIDS FILE DETECTOR <HIDS>"
+TO="TO <TO@gmail.com>"
+
+
 NAME="sids"
 AUTHOR="L. Abramovich"
 WEBSITE="https://github.com/leo-arch/sids"
@@ -154,7 +158,6 @@ function check_config ()
 #/etc/samba/smb.conf
 #/etc/systemd/system
 #/usr/lib/systemd/system
-#!/usr/lib/systemd/system/*.wants
 #/etc/sysctl.conf
 #/etc/sysctl.d
 #/etc/hosts
@@ -188,6 +191,47 @@ then run '$NAME -i' to initialize the database"
 	fi
 }
 
+
+function audit_rule ()
+# audit rule
+{
+	echo -e "!\n\
+|||
+|||
+|||===============================AUDIT RULE PROCESS====================================
+|||
+|||"
+	directories_file="/etc/sids/sids.conf"
+
+	# directories_file dosyasını okuyarak directories dizisini oluştur
+	directories=()
+	while IFS= read -r line; do
+    		# Yorum satırlarını (# ile başlayan) ve boş satırları atla
+	    	if [[ ! "$line" =~ ^# ]] && [[ -n "$line" ]]; then
+        		directories+=("$line")
+    		fi
+	done < "$directories_file"
+	# Auditd kural dosyasını yedekle
+	sudo cp /etc/audit/rules.d/audit.rules /etc/audit/rules.d/audit.rules.bak
+
+	# Mevcut kuralları oku
+	existing_rules=$(sudo cat /etc/audit/rules.d/audit.rules)
+
+	# Her dizin için auditd kuralı ekle
+	for dir in "${directories[@]}"; do
+		# Eğer kural zaten mevcutsa atla
+    		if ! echo "$existing_rules" | grep -q "\-w $dir -p war -k desktop_access"; then
+		        echo "-w $dir -p war -k desktop_access" | sudo tee -a /etc/audit/rules.d/audit.rules
+		fi
+	done
+
+	# Auditd hizmetine kuralların değiştiğini bildir
+	sudo auditctl -R /etc/audit/rules.d/audit.rules
+
+	echo "Auditd kuralları başarıyla eklendi ve hizmet yeni kuralları okudu."
+
+}
+
 function check_db ()
 # Check all files in the database against same files in filesystem
 {
@@ -202,6 +246,16 @@ function check_db ()
 
 	# Set IFS to ":", since fields in database are colon separated
 	IFS=":"
+
+
+
+#
+# ==========================================================================================================
+#
+
+
+
+	FILE_CHGD=""
 	err_count=0
 
 	# Read the database
@@ -264,22 +318,49 @@ function check_db ()
 			fi
 			log "$file: MODIFIED:$mod_str ($mtime)"
 			(( err_count++ ))
+			FILE_CHGD="$file: DOSYASI DEĞİŞTİRİLDİ:$mod_str ($mtime)" 
+			echo "$FILE_CHGD" >> logsForMail.txt
+			echo "$file: MODIFIED:$mod_str ($mtime) - $FILE_CHGD"
+			#./email.sh $FROM $TO "Test" "$file: MOFIFIED:$mod_str ($mtime)"
 		fi
 
 		unset file hash tmp_hash owner group perms
 	done < "$DB_FILE"
 
+	line_count=$(wc -l < stopMail.txt)
+
+	line_countTek=$(wc -l < stopMailTek.txt)
+
 	# If everything is fine
 	if [[ $err_count -eq 0 ]]; then
-		[[ $quiet -eq 0 ]] && echo -e "\n${g}[+]$nc No problem was found"		
+		[[ $quiet -eq 0 ]] && echo -e "\n${g}[+]$nc No problem was found"
 		log "[+] No problem was found"
 	# If there were errors
 	elif [[ $err_count -gt 1 ]]; then
 		[[ $quiet -eq 0 ]] && echo -e "\n${r}[-]$nc $err_count files were modified"
 		log "[-] $err_count files were modified"
+		echo "Cok dosya birden değişti" >> stopMail.txt
+
+		if [ "$line_count" -lt 10 ]; then
+	    
+			./email.sh $FROM $TO "SOME FILES WERE MODIFIED! PLEASE CHECK!" "$(cat logsForMail.txt)"
+			echo "COk dosya değisti mail gidiyor $(cat logsForMail.txt)"
+		else
+		    	echo "Mail gönderimi durduruluyor."
+		fi
+		
 	else
 		[[ $quiet -eq 0 ]] && echo -e "\n${r}[-]$nc 1 file was modified"
 		log "[-] 1 file was modified"
+	      	echo " " > logsForMail.txt
+		echo "Tek dosya değişti" >> stopMailTektxt
+
+		if [ "$line_countTek" -lt 10 ]; then
+			./email.sh $FROM $TO "1 FILE WAS MODIFIED! PLEASE CHECK!" $FILE_CHGD
+			echo "Tek dosya değişti maili gidiyor $FILE_CHGD"
+		else
+    			echo "Mail gönderimi durduruluyor."
+		fi
 	fi
 
 	# Print the last database update
@@ -288,12 +369,45 @@ function check_db ()
 	if [[ $quiet -eq 0 ]]; then
 		echo -e "\nNOTE: Last database update: $last_update"
 	fi
+	
+	echo " " > logsForMail.txt
+	
+
 	log "NOTE: Last database update: $last_update"
+
+	check_admin_actions
 
 	unset IFS
 
 	[[ $err_count -gt 0 ]] && exit $ERROR
 }
+
+function check_admin_actions () 
+#Cheking sudo actions
+{
+	recent_actions=$(sudo ausearch -k desktop_access -ts recent -te now | sudo aureport -f -i)
+    	if [[ -n $recent_actions ]]; then
+        	echo "Recent administrative actions detected:"
+  	# Filtreleme işlemi: "openat" içeren satırları çıkart
+  	     	filtered_actions=$(echo "$recent_actions" | grep -v "openat")
+		if [[ $(echo "$filtered_actions" | wc -l) -le 5 ]]; then
+			echo "$filtered_actions"
+			filtered_actions=""
+    		else
+			echo "$recent_actions"
+			./email.sh $FROM $TO "THERE MIGHT BE SECURITY ISSUES! PLEASE CHECK!" "LOGS OF AUDIT:\n$filtered_actions"
+		fi
+	else
+        	echo "No recent administrative actions detected."
+    	fi
+
+}
+
+
+#
+# ================================================================================================================================
+#
+
 
 function init_db ()
 # Generate the files database
@@ -364,6 +478,7 @@ to do"
 		exit $SUCCESS
 	fi
 
+	# Set the current date
 	# Set the current date
 	echo "# File generated: $(date)" > "$DB_FILE"
 
@@ -444,6 +559,7 @@ to do"
 		# Do not allow anyone but root to read/write this database
 		/usr/bin/chown 0:0 "$DB_FILE"
 		/usr/bin/chmod 600 "$DB_FILE"
+		audit_rule
 		exit $SUCCESS
 	else
 		if [[ $quiet -eq 0 ]]; then
@@ -452,6 +568,7 @@ to do"
 		log "[-] Error generating the database. Try again"
 		exit $ERROR
 	fi
+
 }
 
 function del_db ()
@@ -504,7 +621,6 @@ function search_logs ()
 	/usr/bin/grep "$str" "$LOG_FILE"
 }
 
-						##################
 						#      MAIN      #
 						##################
 
@@ -520,11 +636,12 @@ if [[ -z $1 ]]; then
 fi
 
 # Process arguments
-while getopts ":bcdghilqs:v" opt; do
+while getopts ":bcdghilqs:vy" opt; do
 	case $opt in
 		b) bonus ;;
 
-		c) 
+		c)
+		       		
 			check_id
 			check_config
 			check_db
@@ -544,6 +661,7 @@ while getopts ":bcdghilqs:v" opt; do
 			check_id
 			check_config
 			init_db
+			audit_rule
 		;;
 
 		l) 
@@ -557,6 +675,8 @@ while getopts ":bcdghilqs:v" opt; do
 		s) search_logs "$OPTARG" ;;
 		
 		v) version ;;
+
+		y) check_admin_actions ;;
 
 		\?) echoerr "${OPTARG}: Invalid argument"; exit $ERROR ;;
 
